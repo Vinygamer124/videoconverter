@@ -49,7 +49,7 @@ class Bar(ctx: Context, private val track: Int, private val fill: Int) : View(ct
 
 class MainActivity : ComponentActivity() {
     private val codecs = listOf("H.264" to MimeTypes.VIDEO_H264, "H.265" to MimeTypes.VIDEO_H265, "AV1" to MimeTypes.VIDEO_AV1)
-    private val rates = listOf("2 Mbps" to 2_000_000, "4 Mbps" to 4_000_000, "8 Mbps" to 8_000_000, "16 Mbps" to 16_000_000)
+    private val speeds = listOf("Chuẩn", "Nhanh")
 
     private val night by lazy { (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES }
     private val cBg by lazy { if (night) 0xFF0E1013.toInt() else 0xFFF5F6F8.toInt() }
@@ -63,7 +63,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: android.content.SharedPreferences
     private var codecIdx = 1
-    private var rateIdx = 2
+    private var speedIdx = 0
     private var delOrig = false
     private var outDir: Uri? = null
 
@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
         uris.forEach { u ->
             try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
             catch (_: Exception) { try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {} }
-            ConvertService.jobs.add(Job(u, nameOf(u), codecs[codecIdx].second, rates[rateIdx].second, outDir, delOrig))
+            ConvertService.jobs.add(Job(u, nameOf(u), codecs[codecIdx].second, speedIdx == 1, outDir, delOrig))
         }
         if (uris.isNotEmpty()) {
             ContextCompat.startForegroundService(this, Intent(this, ConvertService::class.java))
@@ -131,7 +131,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        codecIdx = prefs.getInt("codec", 1); rateIdx = prefs.getInt("rate", 2); delOrig = prefs.getBoolean("del", false)
+        codecIdx = prefs.getInt("codec", 1); speedIdx = prefs.getInt("speed", 0); delOrig = prefs.getBoolean("del", false)
         outDir = prefs.getString("outDir", null)?.let { Uri.parse(it) }
         if (Build.VERSION.SDK_INT >= 33) perm.launch(Manifest.permission.POST_NOTIFICATIONS)
 
@@ -154,8 +154,9 @@ class MainActivity : ComponentActivity() {
         val set = card()
         set.addView(tv("Codec đầu ra", 12f, cMu, true))
         set.addView(seg(codecs.map { it.first }, codecIdx) { codecIdx = it; prefs.edit().putInt("codec", it).apply() }, lp(top = 6))
-        set.addView(tv("Bitrate", 12f, cMu, true), lp(top = 14))
-        set.addView(seg(rates.map { it.first }, rateIdx) { rateIdx = it; prefs.edit().putInt("rate", it).apply() }, lp(top = 6))
+        set.addView(tv("Chế độ", 12f, cMu, true), lp(top = 14))
+        set.addView(seg(speeds, speedIdx) { speedIdx = it; prefs.edit().putInt("speed", it).apply() }, lp(top = 6))
+        set.addView(tv("Chuẩn: ưu tiên chất lượng · Nhanh: mã hoá nhanh hơn, dung lượng có thể nhỉnh hơn. Bitrate tự tính theo video gốc.", 12f, cMu).apply { setLineSpacing(0f, 1.2f) }, lp(top = 6))
         set.addView(tv("Thư mục lưu", 12f, cMu, true), lp(top = 14))
         val fRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL; background = shape(cBg, 10, cBd); setPadding(dp(12), dp(11), dp(12), dp(11))
@@ -279,7 +280,7 @@ class MainActivity : ComponentActivity() {
             }
             c.addView(top)
             val (txt, col) = when (j.state) {
-                St.WAIT -> "Đang chờ · ${names[j.mime]}${if (j.deleteOriginal) " · sẽ xoá file gốc" else ""}" to cMu
+                St.WAIT -> "Đang chờ · ${names[j.mime]} · ${if (j.fast) "Nhanh" else "Chuẩn"}${if (j.deleteOriginal) " · sẽ xoá file gốc" else ""}" to cMu
                 St.RUN -> "Đang chuyển đổi · ${j.progress}%" + (if (j.etaSec >= 0) " · còn ~${fmtDur(j.etaSec)}" else "") to cAc
                 St.SAVE -> "Đang lưu…" to cAc
                 St.DONE -> "Xong ✓ · ${j.msg}" to cOk

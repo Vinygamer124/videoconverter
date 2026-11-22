@@ -12,12 +12,17 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.transformer.*
 import java.io.File
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.media.MediaCodecInfo
+import android.provider.OpenableColumns
 import java.io.IOException
 
 enum class St { WAIT, RUN, SAVE, DONE, ERR }
 
 class Job(
-    val uri: Uri, val name: String, val mime: String, val bitrate: Int,
+    val uri: Uri, val name: String, val mime: String, val fast: Boolean,
     val outDir: Uri?, val deleteOriginal: Boolean
 ) {
     var state = St.WAIT
@@ -86,7 +91,12 @@ class ConvertService : Service() {
         val tmp = File(cacheDir, "out_${System.nanoTime()}.mp4")
         val enc = DefaultEncoderFactory.Builder(this)
             .setEnableFallback(false)
-            .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(j.bitrate).build())
+            .setRequestedVideoEncoderSettings(
+                VideoEncoderSettings.Builder()
+                    .setBitrate(planBitrate(j))
+                    .setBitrateMode(if (j.fast) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+                                    else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                    .build())
             .build()
         val t = Transformer.Builder(this)
             .setVideoMimeType(j.mime)
@@ -107,6 +117,44 @@ class ConvertService : Service() {
         transformer = t
         t.start(MediaItem.fromUri(j.uri), tmp.absolutePath)
         poll(t, j)
+    }
+
+
+    // Bitrate tự động theo video gốc (giống planBitrate trong bản HTML)
+    private fun planBitrate(j: Job): Int {
+        val eff = mapOf(MimeTypes.VIDEO_H264 to 1.0, MimeTypes.VIDEO_H265 to 0.70, MimeTypes.VIDEO_AV1 to 0.60)
+        try {
+            var w = 0; var h = 0; var durMs = 0L
+            MediaMetadataRetriever().also { r ->
+                try {
+                    r.setDataSource(this, j.uri)
+                    w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 0
+                    h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 0
+                    durMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
+                } finally { r.release() }
+            }
+            val size = contentResolver.query(j.uri, null, null, null, null)?.use {
+                if (it.moveToFirst()) it.getLong(it.getColumnIndexOrThrow(OpenableColumns.SIZE)) else 0L
+            } ?: 0L
+            var srcMime = MimeTypes.VIDEO_H264; var hasAudio = false
+            MediaExtractor().also { e ->
+                try {
+                    e.setDataSource(this, j.uri, null)
+                    for (i in 0 until e.trackCount) {
+                        val m = e.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
+                        if (m.startsWith("video/") && srcMime == MimeTypes.VIDEO_H264) srcMime = m
+                        if (m.startsWith("audio/")) hasAudio = true
+                    }
+                } finally { e.release() }
+            }
+            if (durMs <= 0 || size <= 0) return 8_000_000
+            val total = size * 8.0 / (durMs / 1000.0)
+            val video = if (hasAudio) Math.max(total - 160_000, total * 0.8) else total
+            val ratio = (eff[j.mime] ?: 1.0) / (eff[srcMime] ?: 1.0)
+            val floor = w.toDouble() * h * 0.6 * (eff[j.mime] ?: 1.0)
+            val target = Math.min(video, Math.max(floor, video * ratio * 1.15))
+            return target.toInt().coerceIn(500_000, 80_000_000)
+        } catch (_: Exception) { return 8_000_000 }
     }
 
     private fun poll(t: Transformer, j: Job) {
