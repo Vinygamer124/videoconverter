@@ -5,15 +5,36 @@ import android.content.*
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.*
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.transformer.*
 import java.io.File
+import java.io.IOException
 
-class Job(val uri: Uri, val name: String, val mime: String, val bitrate: Int) {
-    var state = "Chờ"; var progress = 0
+enum class St { WAIT, RUN, SAVE, DONE, ERR }
+
+class Job(
+    val uri: Uri, val name: String, val mime: String, val bitrate: Int,
+    val outDir: Uri?, val deleteOriginal: Boolean
+) {
+    var state = St.WAIT
+    var progress = 0
+    var msg = ""
+    var t0 = 0L            // elapsedRealtime lúc bắt đầu chạy
+    var etaSec = -1.0      // ước tính còn lại (giây), -1 = đang đo
+    var lastP = 0; var lastT = 0L; var ema = 0.0
+}
+
+fun fmtDur(sec: Double): String {
+    val s = Math.max(0, Math.round(sec)).toInt()
+    return when {
+        s < 60 -> "${s}s"
+        s < 3600 -> "${s / 60}p ${s % 60}s"
+        else -> "${s / 3600}g ${(s % 3600) / 60}p"
+    }
 }
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
@@ -32,6 +53,7 @@ class ConvertService : Service() {
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onCreate() {
+        super.onCreate()
         nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CH, "Chuyển đổi video", NotificationManager.IMPORTANCE_LOW))
         wake = (getSystemService(POWER_SERVICE) as PowerManager)
@@ -52,14 +74,15 @@ class ConvertService : Service() {
         .build()
 
     private fun update(j: Job) {
-        nm.notify(1, notif("${j.name}: ${j.state} ${j.progress}%", j.progress))
+        val eta = if (j.state == St.RUN && j.etaSec >= 0) " · còn ~${fmtDur(j.etaSec)}" else ""
+        nm.notify(1, notif("${j.name}: ${j.progress}%$eta", j.progress))
         onChange?.invoke()
     }
 
     private fun next() {
-        val j = jobs.firstOrNull { it.state == "Chờ" }
+        val j = jobs.firstOrNull { it.state == St.WAIT }
         if (j == null) { current = null; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return }
-        current = j; j.state = "Đang chạy"; update(j)
+        current = j; j.state = St.RUN; j.t0 = SystemClock.elapsedRealtime(); update(j)
         val tmp = File(cacheDir, "out_${System.nanoTime()}.mp4")
         val enc = DefaultEncoderFactory.Builder(this)
             .setEnableFallback(false)
@@ -70,15 +93,15 @@ class ConvertService : Service() {
             .setEncoderFactory(enc)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(c: Composition, r: ExportResult) {
-                    j.state = "Đang lưu"; update(j)
+                    j.state = St.SAVE; j.progress = 100; update(j)
                     Thread {
-                        try { save(tmp, j); j.state = "Xong"; j.progress = 100 }
-                        catch (e: Exception) { j.state = "Lỗi lưu: ${e.message}" }
+                        try { save(tmp, j); j.state = St.DONE; j.progress = 100 }
+                        catch (e: Exception) { j.state = St.ERR; j.msg = "Lỗi lưu: ${e.message}" }
                         tmp.delete(); main.post { update(j); finish() }
                     }.start()
                 }
                 override fun onError(c: Composition, r: ExportResult, e: ExportException) {
-                    j.state = "Lỗi: ${e.errorCodeName}"; tmp.delete(); update(j); finish()
+                    j.state = St.ERR; j.msg = "Lỗi: ${e.errorCodeName}"; tmp.delete(); update(j); finish()
                 }
             }).build()
         transformer = t
@@ -87,10 +110,34 @@ class ConvertService : Service() {
     }
 
     private fun poll(t: Transformer, j: Job) {
-        if (j.state != "Đang chạy" || transformer !== t) return
+        if (j.state != St.RUN || transformer !== t) return
         val h = ProgressHolder()
-        if (t.getProgress(h) != Transformer.PROGRESS_STATE_NOT_STARTED) { j.progress = h.progress; update(j) }
+        if (t.getProgress(h) != Transformer.PROGRESS_STATE_NOT_STARTED) {
+            j.progress = h.progress; calcEta(j)
+        }
+        update(j)
         main.postDelayed({ poll(t, j) }, 700)
+    }
+
+    // ETA: trộn tốc độ trung bình toàn cục với tốc độ gần nhất, làm mượt để số không giật
+    private fun calcEta(j: Job) {
+        val now = SystemClock.elapsedRealtime()
+        val el = (now - j.t0) / 1000.0
+        val p = j.progress
+        if (j.lastT != 0L && now - j.lastT >= 2000 && p > j.lastP) {
+            val inst = (p - j.lastP) / ((now - j.lastT) / 1000.0)
+            j.ema = if (j.ema == 0.0) inst else 0.7 * j.ema + 0.3 * inst
+            j.lastP = p; j.lastT = now
+        } else if (j.lastT == 0L) { j.lastP = p; j.lastT = now }
+        if (el < 4 || p < 2) return
+        val global = p / el
+        val rate = if (j.ema > 0) 0.6 * global + 0.4 * j.ema else global
+        if (rate <= 0) return
+        val est = (100 - p) / rate
+        j.etaSec = if (j.etaSec < 0) est else {
+            val dec = Math.max(0.0, j.etaSec - 0.7)
+            dec + 0.25 * (est - dec)
+        }
     }
 
     private fun finish() { transformer = null; current = null; next() }
@@ -98,13 +145,37 @@ class ConvertService : Service() {
     private fun save(f: File, j: Job) {
         val base = j.name.substringBeforeLast('.')
         val tag = when (j.mime) { MimeTypes.VIDEO_H265 -> "h265"; MimeTypes.VIDEO_AV1 -> "av1"; else -> "h264" }
-        val v = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, "${base}_$tag.mp4")
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Converted")
+        val fileName = "${base}_$tag.mp4"
+        var target: Uri? = null
+        if (j.outDir != null) {
+            try {
+                val parent = DocumentsContract.buildDocumentUriUsingTree(j.outDir, DocumentsContract.getTreeDocumentId(j.outDir))
+                target = DocumentsContract.createDocument(contentResolver, parent, "video/mp4", fileName)
+            } catch (_: Exception) {}
         }
-        val u = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)!!
-        contentResolver.openOutputStream(u)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+        var note = ""
+        if (target == null) {
+            if (j.outDir != null) note = "Không ghi được vào thư mục đã chọn, đã lưu ở Movies/Converted. "
+            val v = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Converted")
+            }
+            target = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)
+                ?: throw IOException("không tạo được file đầu ra")
+        }
+        val written = contentResolver.openOutputStream(target)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+        if (written <= 0 || written != f.length()) throw IOException("file ghi ra không đầy đủ")
+        note += "Đã lưu $fileName"
+        if (j.deleteOriginal) {
+            note += if (deleteOriginal(j.uri)) " · đã xoá file gốc" else " · không xoá được file gốc"
+        }
+        j.msg = note
+    }
+
+    private fun deleteOriginal(u: Uri): Boolean {
+        try { if (DocumentsContract.deleteDocument(contentResolver, u)) return true } catch (_: Exception) {}
+        return try { contentResolver.delete(u, null, null) > 0 } catch (_: Exception) { false }
     }
 
     override fun onDestroy() {
