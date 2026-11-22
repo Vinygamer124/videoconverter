@@ -137,9 +137,6 @@ class MainActivity : ComponentActivity() {
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(cBg) }
-        WindowCompat.getInsetsController(window, root).apply {
-            isAppearanceLightStatusBars = !night; isAppearanceLightNavigationBars = !night
-        }
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, ins ->
             val b = ins.getInsets(WindowInsetsCompat.Type.systemBars())
             v.setPadding(dp(16), b.top + dp(14), dp(16), b.bottom + dp(14)); ins
@@ -221,6 +218,11 @@ class MainActivity : ComponentActivity() {
         root.addView(add, lp(top = 12))
 
         setContentView(root)
+        try {
+            WindowCompat.getInsetsController(window, root).apply {
+                isAppearanceLightStatusBars = !night; isAppearanceLightNavigationBars = !night
+            }
+        } catch (_: Exception) {}
         updateFolder()
     }
 
