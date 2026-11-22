@@ -1,6 +1,7 @@
 package com.alex.videoconv
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
@@ -16,6 +17,7 @@ import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.LinearInterpolator
 import android.widget.*
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -36,15 +38,57 @@ class PickVideos : ActivityResultContracts.OpenMultipleDocuments() {
         )
 }
 
-class Bar(ctx: Context, private val track: Int, private val fill: Int) : View(ctx) {
-    var value = 0f
-        set(v) { field = v.coerceIn(0f, 1f); invalidate() }
+// Thanh tiến trình: chạy mượt giữa các lần cập nhật, đổ màu gradient, có chế độ "đang khởi động"
+class Bar(ctx: Context, private val track: Int, private val c1: Int, private val c2: Int) : View(ctx) {
+    private var shown = 0f
+    private var anim: ValueAnimator? = null
+    private var shim: ValueAnimator? = null
+    private var phase = 0f
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
-    override fun onDraw(c: Canvas) {
-        val r = height / 2f
-        p.color = track; c.drawRoundRect(0f, 0f, width.toFloat(), height.toFloat(), r, r, p)
-        if (value > 0f) { p.color = fill; c.drawRoundRect(0f, 0f, Math.max(height.toFloat(), width * value), height.toFloat(), r, r, p) }
+    private val clip = Path()
+
+    var indeterminate = false
+        set(v) {
+            if (field == v) return
+            field = v
+            shim?.cancel()
+            if (v) shim = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 1100; repeatCount = ValueAnimator.INFINITE; interpolator = LinearInterpolator()
+                addUpdateListener { phase = it.animatedValue as Float; invalidate() }; start()
+            }
+            invalidate()
+        }
+
+    fun set(v: Float, animate: Boolean = true) {
+        val t = v.coerceIn(0f, 1f)
+        anim?.cancel()
+        if (!animate || width == 0 || t < shown) { shown = t; invalidate(); return }
+        anim = ValueAnimator.ofFloat(shown, t).apply {
+            duration = 500; interpolator = LinearInterpolator()
+            addUpdateListener { shown = it.animatedValue as Float; invalidate() }; start()
+        }
     }
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat(); val r = h / 2f
+        p.shader = null; p.color = track
+        c.drawRoundRect(0f, 0f, w, h, r, r, p)
+        if (indeterminate) {
+            clip.reset(); clip.addRoundRect(0f, 0f, w, h, r, r, Path.Direction.CW)
+            c.save(); c.clipPath(clip)
+            val seg = w * 0.35f; val x = (w + seg) * phase - seg
+            p.shader = LinearGradient(x, 0f, x + seg, 0f, c1, c2, Shader.TileMode.CLAMP)
+            c.drawRoundRect(x, 0f, x + seg, h, r, r, p)
+            c.restore()
+        } else if (shown > 0f) {
+            val fw = Math.max(h, w * shown)
+            p.shader = LinearGradient(0f, 0f, fw, 0f, c1, c2, Shader.TileMode.CLAMP)
+            c.drawRoundRect(0f, 0f, fw, h, r, r, p)
+        }
+        p.shader = null
+    }
+
+    override fun onDetachedFromWindow() { anim?.cancel(); shim?.cancel(); super.onDetachedFromWindow() }
 }
 
 class MainActivity : ComponentActivity() {
@@ -58,6 +102,7 @@ class MainActivity : ComponentActivity() {
     private val cMu by lazy { if (night) 0xFF8E97A6.toInt() else 0xFF7A8190.toInt() }
     private val cBd by lazy { if (night) 0xFF272C35.toInt() else 0xFFE4E7EC.toInt() }
     private val cAc by lazy { if (night) 0xFF7B8FFF.toInt() else 0xFF4F6BFF.toInt() }
+    private val cAc2 by lazy { if (night) 0xFFB79CFF.toInt() else 0xFF8B5CF6.toInt() }
     private val cOk by lazy { if (night) 0xFF4ADE80.toInt() else 0xFF16A34A.toInt() }
     private val cEr by lazy { if (night) 0xFFF87171.toInt() else 0xFFDC2626.toInt() }
 
@@ -70,9 +115,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var folderTv: TextView
     private lateinit var sumCard: LinearLayout
     private lateinit var sumPct: TextView
+    private lateinit var sumEta: TextView
     private lateinit var sumBar: Bar
     private lateinit var sumStats: TextView
     private lateinit var listBox: LinearLayout
+    private lateinit var btnAdd: TextView
+    private lateinit var btnMain: TextView
 
     private val pick = registerForActivityResult(PickVideos()) { uris ->
         uris.forEach { u ->
@@ -80,10 +128,7 @@ class MainActivity : ComponentActivity() {
             catch (_: Exception) { try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {} }
             ConvertService.jobs.add(Job(u, nameOf(u), codecs[codecIdx].second, speedIdx == 1, outDir, delOrig))
         }
-        if (uris.isNotEmpty()) {
-            ContextCompat.startForegroundService(this, Intent(this, ConvertService::class.java))
-            render()
-        }
+        render()   // chỉ thêm vào hàng đợi, bấm "Bắt đầu" mới chạy
     }
     private val pickDir = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { u ->
         if (u != null) {
@@ -128,10 +173,12 @@ class MainActivity : ComponentActivity() {
         paint(sel); return box
     }
 
+    private fun bar(v: Float) = Bar(this, cBd, cAc, cAc2).apply { set(v, false) }
+
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        if (ConvertService.jobs.none { it.state == St.RUN || it.state == St.SAVE })
+        if (!ConvertService.active)
             cacheDir.listFiles()?.filter { it.name.startsWith("out_") }?.forEach { it.delete() }
         codecIdx = prefs.getInt("codec", 1); speedIdx = prefs.getInt("speed", 0); delOrig = prefs.getBoolean("del", false)
         outDir = prefs.getString("outDir", null)?.let { Uri.parse(it) }
@@ -144,7 +191,6 @@ class MainActivity : ComponentActivity() {
             v.setPadding(dp(16), b.top + dp(14), dp(16), b.bottom + dp(14)); ins
         }
 
-        // Tiêu đề
         root.addView(tv("Video Converter", 26f, cTx, true))
         root.addView(tv("Nén & đổi codec video ngay trên máy", 13f, cMu), lp(top = 2))
 
@@ -168,21 +214,20 @@ class MainActivity : ComponentActivity() {
         fRow.addView(folderTv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         fRow.addView(tv("Đổi", 13f, cAc, true).apply { setPadding(dp(10), 0, dp(4), 0) })
         set.addView(fRow, lp(top = 6))
-        val reset = tv("Dùng mặc định (Movies/Converted)", 12f, cMu).apply {
+        set.addView(tv("Dùng mặc định (Movies/Converted)", 12f, cMu).apply {
             setPadding(0, dp(8), 0, dp(2))
             setOnClickListener { outDir = null; prefs.edit().remove("outDir").apply(); updateFolder() }
-        }
-        set.addView(reset)
+        })
         val dRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         val dTxt = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         dTxt.addView(tv("Tự xoá file gốc", 14f, cTx, true))
-        dTxt.addView(tv("Chỉ xoá sau khi file mới đã lưu đầy đủ", 12f, cMu))
+        dTxt.addView(tv("Chỉ xoá sau khi kiểm tra file mới đủ thời lượng", 12f, cMu))
         dRow.addView(dTxt, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val sw = Switch(this).apply { isChecked = delOrig }
         sw.setOnCheckedChangeListener { b, on ->
             if (on) {
                 AlertDialog.Builder(this).setTitle("Bật tự xoá file gốc?")
-                    .setMessage("Video gốc sẽ bị xoá vĩnh viễn sau khi chuyển đổi xong. Chỉ áp dụng cho các video thêm từ giờ.")
+                    .setMessage("Video gốc sẽ bị xoá vĩnh viễn sau khi chuyển đổi xong. Áp dụng khi bấm Bắt đầu.")
                     .setPositiveButton("Bật") { _, _ -> delOrig = true; prefs.edit().putBoolean("del", true).apply() }
                     .setNegativeButton("Huỷ") { _, _ -> b.isChecked = false }
                     .setOnCancelListener { b.isChecked = false }.show()
@@ -194,11 +239,15 @@ class MainActivity : ComponentActivity() {
 
         // Thẻ tiến trình
         sumCard = card().apply { visibility = View.GONE }
-        sumPct = tv("0%", 32f, cTx, true)
-        sumBar = Bar(this, cBd, cAc)
+        val head = LinearLayout(this).apply { gravity = Gravity.BOTTOM }
+        sumPct = tv("0%", 34f, cTx, true)
+        sumEta = tv("", 15f, cAc, true).apply { gravity = Gravity.END; setPadding(0, 0, 0, dp(6)) }
+        head.addView(sumPct, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        head.addView(sumEta)
+        sumBar = bar(0f)
         sumStats = tv("", 13f, cMu).apply { setLineSpacing(0f, 1.25f) }
-        sumCard.addView(sumPct)
-        sumCard.addView(sumBar, lp(h = dp(8), top = 8))
+        sumCard.addView(head)
+        sumCard.addView(sumBar, lp(h = dp(10), top = 6))
         sumCard.addView(sumStats, lp(top = 10))
         content.addView(sumCard, lp(top = 12))
 
@@ -213,12 +262,19 @@ class MainActivity : ComponentActivity() {
         listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         content.addView(listBox, lp(top = 6))
 
-        // Nút chính
-        val add = tv("+  Chọn video", 16f, Color.WHITE, true).apply {
-            gravity = Gravity.CENTER; background = shape(cAc, 14); setPadding(0, dp(15), 0, dp(15))
+        // Hàng nút: Thêm video + Bắt đầu / Dừng
+        val bottom = LinearLayout(this)
+        btnAdd = tv("+  Thêm video", 15f, cAc, true).apply {
+            gravity = Gravity.CENTER; setPadding(0, dp(15), 0, dp(15))
             setOnClickListener { pick.launch(arrayOf("video/*")) }
         }
-        root.addView(add, lp(top = 12))
+        btnMain = tv("", 15f, Color.WHITE, true).apply {
+            gravity = Gravity.CENTER; setPadding(0, dp(15), 0, dp(15)); visibility = View.GONE
+            setOnClickListener { onMainClick() }
+        }
+        bottom.addView(btnAdd, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bottom.addView(btnMain, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f).apply { marginStart = dp(10) })
+        root.addView(bottom, lp(top = 12))
 
         setContentView(root)
         try {
@@ -227,6 +283,24 @@ class MainActivity : ComponentActivity() {
             }
         } catch (_: Exception) {}
         updateFolder()
+    }
+
+    private fun onMainClick() {
+        if (ConvertService.active) {
+            AlertDialog.Builder(this).setTitle("Dừng chuyển đổi?")
+                .setMessage("File đang chạy sẽ bị huỷ và quay về hàng đợi. File đã xong được giữ nguyên.")
+                .setPositiveButton("Dừng") { _, _ ->
+                    startService(Intent(this, ConvertService::class.java).setAction(ConvertService.ACT_STOP))
+                }
+                .setNegativeButton("Tiếp tục", null).show()
+        } else {
+            ConvertService.jobs.filter { it.state == St.WAIT }.forEach {   // áp cài đặt hiện tại cho các file đang chờ
+                it.mime = codecs[codecIdx].second; it.fast = speedIdx == 1; it.outDir = outDir; it.deleteOriginal = delOrig
+            }
+            ConvertService.active = true
+            ContextCompat.startForegroundService(this, Intent(this, ConvertService::class.java))
+            render()
+        }
     }
 
     private fun updateFolder() {
@@ -241,31 +315,48 @@ class MainActivity : ComponentActivity() {
     override fun onPause() { super.onPause(); ConvertService.onChange = null }
 
     private fun render() {
-        val names = mapOf(MimeTypes.VIDEO_H264 to "H.264", MimeTypes.VIDEO_H265 to "H.265", MimeTypes.VIDEO_AV1 to "AV1")
         val jobs = ConvertService.jobs.toList()
+        val running = ConvertService.active
+        val waiting = jobs.count { it.state == St.WAIT }
+
+        // Nút chính
+        if (running) {
+            btnMain.visibility = View.VISIBLE; btnMain.text = "■  Dừng"; btnMain.background = shape(cEr, 14)
+            btnAdd.setTextColor(cAc); btnAdd.background = shape(cSf, 14, cBd)
+        } else if (waiting > 0) {
+            btnMain.visibility = View.VISIBLE; btnMain.text = "▶  Bắt đầu ($waiting)"; btnMain.background = shape(cAc, 14)
+            btnAdd.setTextColor(cAc); btnAdd.background = shape(cSf, 14, cBd)
+        } else {
+            btnMain.visibility = View.GONE
+            btnAdd.setTextColor(Color.WHITE); btnAdd.background = shape(cAc, 14)
+        }
 
         // Tổng quan job đang chạy
         val cur = jobs.firstOrNull { it.state == St.RUN || it.state == St.SAVE }
-        if (cur == null) sumCard.visibility = View.GONE else {
+        if (cur == null) { sumCard.visibility = View.GONE; sumBar.indeterminate = false } else {
             sumCard.visibility = View.VISIBLE
-            sumPct.text = "${cur.progress}%"; sumBar.value = cur.progress / 100f
+            sumPct.text = "${cur.progress}%"
+            sumBar.indeterminate = cur.state == St.RUN && cur.progress == 0
+            sumBar.set(cur.progress / 100f)
             val el = (SystemClock.elapsedRealtime() - cur.t0) / 1000.0
-            val eta = when {
-                cur.state == St.SAVE -> "đang lưu file…"
+            sumEta.text = when {
+                cur.state == St.SAVE -> "đang lưu…"
                 cur.progress >= 98 -> "sắp xong"
                 cur.etaSec < 0 -> "đang đo tốc độ…"
-                else -> "~${fmtDur(cur.etaSec)}" + " · xong lúc " +
-                    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(System.currentTimeMillis() + (cur.etaSec * 1000).toLong()))
+                else -> "còn ~${fmtDur(cur.etaSec)}"
             }
-            val waiting = jobs.count { it.state == St.WAIT }
-            sumStats.text = "File ${jobs.indexOf(cur) + 1}/${jobs.size} · ${cur.name}\nĐã chạy ${fmtDur(el)} · còn $eta" + (if (el > 3 && cur.progress > 0 && cur.durSec > 0) " · %.2f× tốc độ thật".format(cur.progress / 100.0 * cur.durSec / el) else "") +
-                if (waiting > 0) "\n$waiting file đang chờ" else ""
+            val fin = if (cur.state == St.RUN && cur.etaSec >= 0 && cur.progress < 98)
+                " · xong lúc " + SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(System.currentTimeMillis() + (cur.etaSec * 1000).toLong())) else ""
+            val spd = if (el > 3 && cur.progress > 0 && cur.durSec > 0) " · %.2f× tốc độ thật".format(cur.progress / 100.0 * cur.durSec / el) else ""
+            val w = jobs.count { it.state == St.WAIT }
+            sumStats.text = "File ${jobs.indexOf(cur) + 1}/${jobs.size} · ${cur.name}\nĐã chạy ${fmtDur(el)}$fin$spd" +
+                if (w > 0) "\n$w file đang chờ" else ""
         }
 
         // Danh sách
         listBox.removeAllViews()
         if (jobs.isEmpty()) {
-            listBox.addView(tv("Chưa có video nào.\nBấm “Chọn video” để thêm vào hàng đợi.", 13f, cMu).apply {
+            listBox.addView(tv("Chưa có video nào.\nBấm “Thêm video”, rồi bấm “Bắt đầu” khi sẵn sàng.", 13f, cMu).apply {
                 gravity = Gravity.CENTER; setPadding(0, dp(28), 0, dp(28)) })
             return
         }
@@ -282,14 +373,14 @@ class MainActivity : ComponentActivity() {
             }
             c.addView(top)
             val (txt, col) = when (j.state) {
-                St.WAIT -> "Đang chờ · ${names[j.mime]} · ${if (j.fast) "Nhanh" else "Chuẩn"}${if (j.deleteOriginal) " · sẽ xoá file gốc" else ""}" to cMu
+                St.WAIT -> (if (running) "Trong hàng đợi" else "Sẵn sàng · bấm Bắt đầu") to cMu
                 St.RUN -> "Đang chuyển đổi · ${j.progress}%" + (if (j.etaSec >= 0) " · còn ~${fmtDur(j.etaSec)}" else "") to cAc
                 St.SAVE -> "Đang lưu…" to cAc
                 St.DONE -> "Xong ✓ · ${j.msg}" to cOk
                 St.ERR -> j.msg to cEr
             }
             c.addView(tv(txt, 12f, col).apply { setLineSpacing(0f, 1.2f) }, lp(top = 3))
-            if (j.state == St.RUN || j.state == St.SAVE) c.addView(Bar(this, cBd, cAc).apply { value = j.progress / 100f }, lp(h = dp(5), top = 8))
+            if (j.state == St.RUN || j.state == St.SAVE) c.addView(bar(j.progress / 100f), lp(h = dp(5), top = 8))
             listBox.addView(c, lp(top = 6))
         }
     }
