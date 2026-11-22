@@ -29,6 +29,7 @@ class Job(
     var progress = 0
     var msg = ""
     var t0 = 0L            // elapsedRealtime lúc bắt đầu chạy
+    var durSec = 0.0
     var etaSec = -1.0      // ước tính còn lại (giây), -1 = đang đo
     var lastP = 0; var lastT = 0L; var ema = 0.0
 }
@@ -96,6 +97,7 @@ class ConvertService : Service() {
                     .setBitrate(planBitrate(j))
                     .setBitrateMode(if (j.fast) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                                     else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                    .setEncoderPerformanceParameters(Short.MAX_VALUE.toInt(), 1)
                     .build())
             .build()
         val t = Transformer.Builder(this)
@@ -147,6 +149,7 @@ class ConvertService : Service() {
                     }
                 } finally { e.release() }
             }
+            j.durSec = durMs / 1000.0
             if (durMs <= 0 || size <= 0) return 8_000_000
             val total = size * 8.0 / (durMs / 1000.0)
             val video = if (hasAudio) Math.max(total - 160_000, total * 0.8) else total

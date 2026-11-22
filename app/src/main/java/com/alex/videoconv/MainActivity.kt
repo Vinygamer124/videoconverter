@@ -256,7 +256,7 @@ class MainActivity : ComponentActivity() {
                     SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(System.currentTimeMillis() + (cur.etaSec * 1000).toLong()))
             }
             val waiting = jobs.count { it.state == St.WAIT }
-            sumStats.text = "File ${jobs.indexOf(cur) + 1}/${jobs.size} · ${cur.name}\nĐã chạy ${fmtDur(el)} · còn $eta" +
+            sumStats.text = "File ${jobs.indexOf(cur) + 1}/${jobs.size} · ${cur.name}\nĐã chạy ${fmtDur(el)} · còn $eta" + (if (el > 3 && cur.progress > 0 && cur.durSec > 0) " · %.2f× tốc độ thật".format(cur.progress / 100.0 * cur.durSec / el) else "") +
                 if (waiting > 0) "\n$waiting file đang chờ" else ""
         }
 
