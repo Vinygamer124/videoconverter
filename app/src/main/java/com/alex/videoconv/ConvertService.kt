@@ -63,6 +63,7 @@ class ConvertService : Service() {
     private var pfd: ParcelFileDescriptor? = null
     private var target: Uri? = null          // file đích đang được ghi trực tiếp
     private var direct = false
+    private var curBr = 0
     @Volatile private var runId = 0          // tăng mỗi lần Dừng để huỷ mọi việc đang dở
     private var wake: PowerManager.WakeLock? = null
     private lateinit var nm: NotificationManager
@@ -153,6 +154,7 @@ class ConvertService : Service() {
 
     private fun startEncode(j: Job, br: Int, tryDirect: Boolean) {
         val my = runId
+        curBr = br
         val need = (br * j.durSec / 8 * 1.05).toLong()
         var outPath = ""
         direct = false
@@ -257,10 +259,16 @@ class ConvertService : Service() {
     // ---------- Hoàn tất ----------
     private fun completeDirect(j: Job) {
         j.progress = 100
+        val sz = try { pfd?.statSize ?: 0L } catch (_: Exception) { 0L }
         try { pfd?.close() } catch (_: Exception) {}
         pfd = null
         val u = target
-        if (u == null || sizeOf(u) <= 0) { fail(j, "File đầu ra rỗng"); return }
+        if (u == null || sz <= 0) {   // ghi trực tiếp không ra dữ liệu -> thử lại bằng file tạm
+            discardOutput(); transformer = null
+            j.progress = 0; j.etaSec = -1.0; j.lastT = 0L; j.ema = 0.0; j.t0 = SystemClock.elapsedRealtime()
+            j.msg = "Máy không cho ghi trực tiếp, đã chuyển sang file tạm. "
+            startEncode(j, curBr, false); return
+        }
         target = null; transformer = null
         finalizeOk(j, u)
         update(j); current = null; next()
@@ -273,18 +281,19 @@ class ConvertService : Service() {
             var u: Uri? = null
             try {
                 u = createTarget(j)
+                var copied = 0L
                 contentResolver.openOutputStream(u, "w")!!.use { o ->
                     tmp.inputStream().use { ins ->
                         val buf = ByteArray(1 shl 20)
                         while (true) {
                             if (runId != my) throw StopEx()
                             val n = ins.read(buf); if (n < 0) break
-                            o.write(buf, 0, n)
+                            o.write(buf, 0, n); copied += n
                         }
                     }
                 }
                 if (runId != my) throw StopEx()
-                if (sizeOf(u) <= 0) throw IOException("file ghi ra rỗng")
+                if (copied <= 0 || copied != tmp.length()) throw IOException("file ghi ra không đầy đủ")
                 finalizeOk(j, u); j.state = St.DONE
             } catch (e: StopEx) {
                 u?.let { deleteDoc(it) }; tmp.delete(); return@Thread
