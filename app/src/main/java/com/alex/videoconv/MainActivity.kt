@@ -131,6 +131,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        if (ConvertService.jobs.none { it.state == St.RUN || it.state == St.SAVE })
+            cacheDir.listFiles()?.filter { it.name.startsWith("out_") }?.forEach { it.delete() }
         codecIdx = prefs.getInt("codec", 1); speedIdx = prefs.getInt("speed", 0); delOrig = prefs.getBoolean("del", false)
         outDir = prefs.getString("outDir", null)?.let { Uri.parse(it) }
         if (Build.VERSION.SDK_INT >= 33) perm.launch(Manifest.permission.POST_NOTIFICATIONS)

@@ -54,6 +54,7 @@ class ConvertService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private var current: Job? = null
     private var transformer: Transformer? = null
+    private var tmpFile: File? = null
     private var wake: PowerManager.WakeLock? = null
     private lateinit var nm: NotificationManager
 
@@ -61,6 +62,7 @@ class ConvertService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        cacheDir.listFiles()?.filter { it.name.startsWith("out_") }?.forEach { it.delete() }
         nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CH, "Chuyển đổi video", NotificationManager.IMPORTANCE_LOW))
         wake = (getSystemService(POWER_SERVICE) as PowerManager)
@@ -91,6 +93,7 @@ class ConvertService : Service() {
         if (j == null) { current = null; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return }
         current = j; j.state = St.RUN; j.t0 = SystemClock.elapsedRealtime(); update(j)
         val tmp = File(cacheDir, "out_${System.nanoTime()}.mp4")
+        tmpFile = tmp
         val br = planBitrate(j)
         val need = (br * j.durSec / 8 * 1.1).toLong()
         val free = StatFs(cacheDir.absolutePath).availableBytes
@@ -266,6 +269,6 @@ class ConvertService : Service() {
     }
 
     override fun onDestroy() {
-        transformer?.cancel(); wake?.takeIf { it.isHeld }?.release(); super.onDestroy()
+        transformer?.cancel(); tmpFile?.delete(); wake?.takeIf { it.isHeld }?.release(); super.onDestroy()
     }
 }
