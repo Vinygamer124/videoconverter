@@ -30,6 +30,7 @@ class Job(
     var msg = ""
     var t0 = 0L            // elapsedRealtime lúc bắt đầu chạy
     var durSec = 0.0
+    var origGone = false
     var etaSec = -1.0      // ước tính còn lại (giây), -1 = đang đo
     var lastP = 0; var lastT = 0L; var ema = 0.0
 }
@@ -90,11 +91,19 @@ class ConvertService : Service() {
         if (j == null) { current = null; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return }
         current = j; j.state = St.RUN; j.t0 = SystemClock.elapsedRealtime(); update(j)
         val tmp = File(cacheDir, "out_${System.nanoTime()}.mp4")
+        val br = planBitrate(j)
+        val need = (br * j.durSec / 8 * 1.1).toLong()
+        val free = StatFs(cacheDir.absolutePath).availableBytes
+        if (j.durSec > 0 && free < need) {
+            j.state = St.ERR
+            j.msg = "Không đủ bộ nhớ: cần trống ~${need / 1048576} MB cho file tạm, hiện còn ${free / 1048576} MB"
+            update(j); finish(); return
+        }
         val enc = DefaultEncoderFactory.Builder(this)
             .setEnableFallback(false)
             .setRequestedVideoEncoderSettings(
                 VideoEncoderSettings.Builder()
-                    .setBitrate(planBitrate(j))
+                    .setBitrate(br)
                     .setBitrateMode(if (j.fast) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                                     else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
                     .setEncoderPerformanceParameters(Short.MAX_VALUE.toInt(), 1)
@@ -215,14 +224,41 @@ class ConvertService : Service() {
             target = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)
                 ?: throw IOException("không tạo được file đầu ra")
         }
-        val written = contentResolver.openOutputStream(target)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+        val written = try {
+            contentResolver.openOutputStream(target)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+        } catch (e: IOException) {
+            val full = (e.message ?: "").let { it.contains("ENOSPC") || it.contains("No space", true) }
+            deleteOriginal(target!!)
+            if (!full) throw e
+            if (j.deleteOriginal && !j.origGone && canFreeBySourceDelete(f, j) && deleteOriginal(j.uri)) {
+                j.origGone = true
+                return save(f, j)
+            }
+            throw IOException("Hết bộ nhớ khi lưu. Cần trống thêm ~${f.length() / 1048576} MB (bật Tự xoá file gốc hoặc chọn thư mục ở thẻ nhớ)")
+        }
         if (written <= 0 || written != f.length()) throw IOException("file ghi ra không đầy đủ")
         note += "Đã lưu $fileName"
         if (j.deleteOriginal) {
-            note += if (deleteOriginal(j.uri)) " · đã xoá file gốc" else " · không xoá được file gốc"
+            note += if (j.origGone) " · đã xoá file gốc trước để lấy chỗ trống"
+                    else if (deleteOriginal(j.uri)) " · đã xoá file gốc" else " · không xoá được file gốc"
         }
         j.msg = note
     }
+
+    // Bản tạm hợp lệ (cùng thời lượng với gốc) và không lớn hơn gốc => xoá gốc sẽ đủ chỗ để lưu
+    private fun canFreeBySourceDelete(f: File, j: Job): Boolean = try {
+        fun dur(set: (MediaMetadataRetriever) -> Unit): Long {
+            val r = MediaMetadataRetriever()
+            try { set(r); return r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L }
+            finally { r.release() }
+        }
+        val a = dur { it.setDataSource(f.absolutePath) }
+        val b = dur { it.setDataSource(this, j.uri) }
+        val src = contentResolver.query(j.uri, null, null, null, null)?.use {
+            if (it.moveToFirst()) it.getLong(it.getColumnIndexOrThrow(OpenableColumns.SIZE)) else 0L
+        } ?: 0L
+        a > 0 && b > 0 && Math.abs(a - b) <= Math.max(1000L, b / 50) && src >= f.length()
+    } catch (_: Exception) { false }
 
     private fun deleteOriginal(u: Uri): Boolean {
         try { if (DocumentsContract.deleteDocument(contentResolver, u)) return true } catch (_: Exception) {}
