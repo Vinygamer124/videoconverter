@@ -14,6 +14,7 @@ import android.provider.OpenableColumns
 import androidx.core.app.NotificationCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.effect.FrameDropEffect
 import androidx.media3.transformer.*
 import java.io.File
 import java.io.IOException
@@ -39,6 +40,8 @@ class Job(
     var enc = 0                 // 0 tự động, 1 phần cứng, 2 phần mềm
     var level = 1               // mức nén
     var capMbps = 0.0           // giới hạn tối đa, 0 = không giới hạn
+    var fps = 0.0               // giới hạn FPS, 0 = giữ FPS gốc
+    var srcFps = 0.0; var srcW = 0; var srcH = 0; var srcVideoBps = 0.0   // thông tin video gốc
     var keepTime = true
     var tCreate = 0L; var tMod = 0L
     var savePct = 0; var saveEta = -1.0; var saveSpeed = 0.0
@@ -76,6 +79,7 @@ class ConvertService : Service() {
     private var target: Uri? = null
     private var direct = false
     private var curBr = 0
+    private var curChk: Enc.Check? = null
     private val session = ArrayList<Job>()
     @Volatile private var runId = 0
     private var wake: PowerManager.WakeLock? = null
@@ -85,6 +89,7 @@ class ConvertService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        CrashGuard.install(applicationContext)
         cacheDir.listFiles()?.filter { it.name.startsWith("out_") }?.forEach { it.delete() }
         nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CH, "Đang chuyển đổi", NotificationManager.IMPORTANCE_LOW).apply {
@@ -185,6 +190,7 @@ class ConvertService : Service() {
     }
 
     private fun discardOutput() {
+        CrashGuard.clear(this)
         try { pfd?.close() } catch (_: Exception) {}
         pfd = null
         tmpFile?.delete(); tmpFile = null
@@ -206,13 +212,29 @@ class ConvertService : Service() {
         if (j.thumb == null) j.thumb = Planner.thumb(this, j.uri)
         val info = Enc.list(j.mime)
         val cn = codecLabel(j.mime)
+        if (j.enc == 3) {
+            if (j.mime != MimeTypes.VIDEO_AV1) { fail(j, "libaom chỉ mã hoá AV1. Hãy chọn codec AV1 hoặc đổi bộ mã hoá."); return }
+            if (!AomNative.available()) { fail(j, "Không nạp được libaom trên máy này (cần chip arm64)."); return }
+            if (Build.VERSION.SDK_INT < 34) { fail(j, "Ghi AV1 vào MP4 cần Android 14 trở lên."); return }
+        }
         if (j.enc == 1 && info.hw.isEmpty()) { fail(j, "Máy không có encoder phần cứng cho $cn. Hãy đổi sang Tự động hoặc Phần mềm."); return }
         if (j.enc == 2 && info.sw.isEmpty()) { fail(j, "Máy không có encoder phần mềm cho $cn. Hãy đổi sang Tự động hoặc Phần cứng."); return }
         val plan = Planner.plan(this, j.uri, j.mime, j.level, j.capMbps)
         j.durSec = plan.durSec; j.srcBytes = plan.srcBytes; j.estBytes = plan.estBytes
+        j.srcFps = plan.fps; j.srcW = plan.w; j.srcH = plan.h; j.srcVideoBps = plan.srcVideoBps
         j.szp.reset(plan.estBytes)
+        if (plan.srcMime == MimeTypes.VIDEO_AV1 && !Enc.canDecode(MimeTypes.VIDEO_AV1)) {
+            fail(j, "Video gốc là AV1 nhưng máy không có bộ giải mã AV1 (cần decoder phần mềm như dav1d). Hãy thử video gốc H.264/H.265."); return
+        }
+        if (j.fps > 0 && plan.fps > 0 && j.fps >= plan.fps - 0.5) j.msg += "Giữ FPS gốc (${fmtFps(plan.fps)}) vì mức đặt không thấp hơn. "
+        val effFps = if (j.fps > 0 && (plan.fps <= 0 || j.fps < plan.fps - 0.5)) j.fps else plan.fps
+        // Kiểm tra encoder trước khi chạy để tránh crash / lỗi khó hiểu (nhất là AV1)
+        val chk = if (j.enc == 3) Enc.Check(true, "", plan.bitrate, "libaom")
+                  else Enc.preflight(j.mime, j.enc, plan.w, plan.h, effFps, plan.bitrate, j.fast)
+        if (!chk.ok) { fail(j, chk.msg); return }
+        curChk = chk
         update(j)
-        startEncode(j, plan.bitrate, true)
+        startEncode(j, chk.bitrate, true)
     }
 
     private fun spaceOk(path: String, need: Long): Boolean =
@@ -248,18 +270,24 @@ class ConvertService : Service() {
             tmpFile = tmp; outPath = tmp.absolutePath
         }
 
+        val chk = curChk
         val vb = VideoEncoderSettings.Builder().setBitrate(br)
-            .setBitrateMode(if (j.fast) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            .setBitrateMode(chk?.bitrateMode ?: if (j.fast) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                             else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-        try {
-            vb.javaClass.getMethod("setEncoderPerformanceParameters", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-                .invoke(vb, Short.MAX_VALUE.toInt(), 1)
-        } catch (_: Throwable) {}
-        val enc = DefaultEncoderFactory.Builder(this)
+        // AV1: không ép operating-rate/priority vì một số encoder AV1 xử lý sai và làm app dừng đột ngột
+        if (j.mime != MimeTypes.VIDEO_AV1) {
+            try {
+                vb.javaClass.getMethod("setEncoderPerformanceParameters", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .invoke(vb, Short.MAX_VALUE.toInt(), 1)
+            } catch (_: Throwable) {}
+        }
+        val defEnc = DefaultEncoderFactory.Builder(this)
             .setEnableFallback(false)
-            .setVideoEncoderSelector(Enc.selector(j.enc))
+            .setVideoEncoderSelector(Enc.selector(if (j.enc == 3) 0 else j.enc, if (j.enc == 3) null else chk?.name))
             .setRequestedVideoEncoderSettings(vb.build())
             .build()
+        val outFps = if (j.fps > 0 && (j.srcFps <= 0 || j.fps < j.srcFps - 0.5)) j.fps else j.srcFps
+        val enc: Codec.EncoderFactory = if (j.enc == 3) AomEncoderFactory(defEnc, br, outFps, j.fast) else defEnc
 
         val wasDirect = direct
         val tmpUsed = tmpFile
@@ -269,6 +297,7 @@ class ConvertService : Service() {
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(c: Composition, r: ExportResult) {
                     if (runId != my) return
+                    CrashGuard.clear(this@ConvertService)
                     if (wasDirect) completeDirect(j) else saveFromTmp(j, tmpUsed!!, my)
                 }
                 override fun onError(c: Composition, r: ExportResult, e: ExportException) {
@@ -284,7 +313,19 @@ class ConvertService : Service() {
                 }
             }).build()
         transformer = t
-        t.start(MediaItem.fromUri(j.uri), outPath)
+        // Giảm FPS bằng cách bỏ bớt khung hình (chỉ giảm được, không tăng)
+        val dropFps = if (j.fps > 0 && (j.srcFps <= 0 || j.fps < j.srcFps - 0.5)) j.fps else 0.0
+        val edited = EditedMediaItem.Builder(MediaItem.fromUri(j.uri)).apply {
+            if (dropFps > 0) setEffects(Effects(emptyList(), listOf(FrameDropEffect.createDefaultFrameDropEffect(dropFps.toFloat()))))
+        }.build()
+        try {
+            CrashGuard.mark(this, j.mime)      // nếu app chết ngay trong encoder, lần sau sẽ báo đúng nguyên nhân
+            t.start(edited, outPath)
+        } catch (e: Throwable) {
+            CrashGuard.clear(this)
+            fail(j, "Không khởi động được bộ mã hoá ${codecLabel(j.mime)}: ${e.message ?: e.javaClass.simpleName}")
+            return
+        }
         poll(t, j, my)
     }
 

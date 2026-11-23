@@ -40,7 +40,12 @@ object Levels {
     val floorF = doubleArrayOf(1.0, 0.75, 0.5)
 }
 
-class Plan(val bitrate: Int, val durSec: Double, val srcBytes: Long, val estBytes: Long)
+class Plan(val bitrate: Int, val durSec: Double, val srcBytes: Long, val estBytes: Long,
+           val w: Int = 0, val h: Int = 0, val fps: Double = 0.0, val srcVideoBps: Double = 0.0,
+           val srcMime: String = MimeTypes.VIDEO_H264)
+
+fun fmtFps(f: Double): String =
+    if (Math.abs(f - Math.round(f)) < 0.05) Math.round(f).toString() else String.format(Locale.US, "%.2f", f)
 
 object Planner {
     private val eff = mapOf(MimeTypes.VIDEO_H264 to 1.0, MimeTypes.VIDEO_H265 to 0.70, MimeTypes.VIDEO_AV1 to 0.60)
@@ -49,6 +54,7 @@ object Planner {
     fun plan(ctx: Context, uri: Uri, mime: String, level: Int, capMbps: Double): Plan {
         var w = 0; var h = 0; var durMs = 0L; var size = 0L
         var srcMime = MimeTypes.VIDEO_H264; var hasAudio = false
+        var frames = 0L; var fpsFmt = 0.0; var videoBps = 0.0
         try {
             val r = MediaMetadataRetriever()
             try {
@@ -56,6 +62,7 @@ object Planner {
                 w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 0
                 h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 0
                 durMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
+                frames = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)?.toLongOrNull() ?: 0L
             } finally { r.release() }
         } catch (_: Exception) {}
         try {
@@ -69,8 +76,14 @@ object Planner {
                 e.setDataSource(ctx, uri, null)
                 var gotVideo = false
                 for (i in 0 until e.trackCount) {
-                    val m = e.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
-                    if (m.startsWith("video/") && !gotVideo) { srcMime = m; gotVideo = true }
+                    val f = e.getTrackFormat(i)
+                    val m = f.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (m.startsWith("video/") && !gotVideo) {
+                        srcMime = m; gotVideo = true
+                        if (f.containsKey(MediaFormat.KEY_FRAME_RATE)) fpsFmt =
+                            try { f.getInteger(MediaFormat.KEY_FRAME_RATE).toDouble() }
+                            catch (_: Exception) { try { f.getFloat(MediaFormat.KEY_FRAME_RATE).toDouble() } catch (_: Exception) { 0.0 } }
+                    }
                     if (m.startsWith("audio/")) hasAudio = true
                 }
             } finally { e.release() }
@@ -83,6 +96,7 @@ object Planner {
         else {
             val total = size * 8.0 / (durMs / 1000.0)
             val video = if (hasAudio) Math.max(total - 160_000, total * 0.8) else total
+            videoBps = video
             val ratio = effT / (eff[srcMime] ?: 1.0)
             val floor = w.toDouble() * h * 0.6 * effT * Levels.floorF[lv]
             br = Math.min(video, Math.max(floor, video * ratio * Levels.factor[lv]))
@@ -91,7 +105,20 @@ object Planner {
         val bi = br.toInt().coerceIn(500_000, 80_000_000)
         val sec = durMs / 1000.0
         val est = if (durMs > 0) (bi * sec / 8 + (if (hasAudio) 160_000 * sec / 8 else 0.0)).toLong() else 0L
-        return Plan(bi, sec, size, est)
+        // FPS thật: ưu tiên số khung hình / thời lượng (chính xác với 29.97, 59.94), không có thì lấy từ metadata
+        val measured = if (frames > 0 && durMs > 0) frames * 1000.0 / durMs else 0.0
+        val fps = if (measured in 1.0..240.0) measured else fpsFmt
+        return Plan(bi, sec, size, est, w, h, fps, videoBps, srcMime)
+    }
+
+    // Gợi ý Mbps theo độ phân giải, FPS, codec và mức nén; không vượt bitrate video gốc
+    fun recommendMbps(w: Int, h: Int, fps: Double, mime: String, level: Int, srcVideoBps: Double): Double {
+        val ww = if (w > 0) w else 1920; val hh = if (h > 0) h else 1080; val ff = if (fps > 0) fps else 30.0
+        val bpp = when (mime) { MimeTypes.VIDEO_H265 -> 0.105; MimeTypes.VIDEO_AV1 -> 0.09; else -> 0.15 }   // bit / điểm ảnh / khung
+        var m = ww.toDouble() * hh * ff * bpp * Levels.factor[level.coerceIn(0, 2)] / 0.85 / 1e6
+        if (srcVideoBps > 0) m = Math.min(m, srcVideoBps / 1e6)
+        m = m.coerceIn(1.0, 80.0)
+        return if (m >= 10) Math.round(m).toDouble() else Math.round(m * 2) / 2.0
     }
 
     fun thumb(ctx: Context, uri: Uri): Bitmap? {

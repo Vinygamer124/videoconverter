@@ -17,6 +17,8 @@ import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.text.Editable
@@ -109,7 +111,7 @@ class MaxScroll(ctx: Context, private val maxH: Int) : ScrollView(ctx) {
 class MainActivity : ComponentActivity() {
     private val codecs = listOf("H.264" to MimeTypes.VIDEO_H264, "H.265" to MimeTypes.VIDEO_H265, "AV1" to MimeTypes.VIDEO_AV1)
     private val speeds = listOf("Chuẩn", "Nhanh")
-    private val encs = listOf("Tự động", "Phần cứng", "Phần mềm")
+    private val encs = listOf("Tự động", "Phần cứng", "Phần mềm", "libaom")
 
     private val night by lazy { (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES }
     private val cBg by lazy { if (night) 0xFF0B0D11.toInt() else 0xFFF3F4F8.toInt() }
@@ -130,6 +132,9 @@ class MainActivity : ComponentActivity() {
     private var levelIdx = 1
     private var encIdx = 0
     private var capMbps = 0.0
+    private var fpsCap = 0.0
+    private var battDlg: AlertDialog? = null
+    private var report: CrashGuard.Verdict? = null
     private var delOrig = false
     private var keepTime = true
     private var outDir: Uri? = null
@@ -148,6 +153,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var btnAdd: TextView
     private lateinit var btnMain: TextView
     private var hwTv: TextView? = null
+    private var aomTv: TextView? = null
     private var swTv: TextView? = null
     private var folderTv: TextView? = null
     private val cards = LinkedHashMap<Job, Card>()
@@ -190,7 +196,7 @@ class MainActivity : ComponentActivity() {
     private fun fmtNum(d: Double) = if (d == Math.floor(d)) d.toLong().toString() else d.toString()
 
     private fun newJob(u: Uri) = Job(u, nameOf(u), codecs[codecIdx].second, speedIdx == 1, outDir, delOrig).also {
-        it.enc = encIdx; it.keepTime = keepTime; it.level = levelIdx; it.capMbps = capMbps
+        it.enc = encIdx; it.keepTime = keepTime; it.level = levelIdx; it.capMbps = capMbps; it.fps = fpsCap
     }
 
     private fun seg(labels: List<String>, sel: Int, on: (Int) -> Unit): LinearLayout {
@@ -226,12 +232,21 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        CrashGuard.install(applicationContext)
         if (!ConvertService.active)
             cacheDir.listFiles()?.filter { it.name.startsWith("out_") }?.forEach { it.delete() }
         codecIdx = prefs.getInt("codec", 1); speedIdx = prefs.getInt("speed", 0); levelIdx = prefs.getInt("level", 1)
         encIdx = prefs.getInt("enc", 0); capMbps = prefs.getFloat("cap", 0f).toDouble()
         delOrig = prefs.getBoolean("del", false); keepTime = prefs.getBoolean("keep", true)
         outDir = prefs.getString("outDir", null)?.let { Uri.parse(it) }
+        fpsCap = prefs.getFloat("fps", 0f).toDouble()
+        // Lần trước app chết giữa lúc mã hoá? Nếu do AV1 crash thì tự chuyển về H.265
+        if (!ConvertService.active) report = CrashGuard.check(this)?.also {
+            if (it.mime == MimeTypes.VIDEO_AV1 && it.kind == 1) {
+                CrashGuard.setAv1Bad(this, true)
+                if (codecIdx == 2) { codecIdx = 1; prefs.edit().putInt("codec", 1).apply() }
+            }
+        }
         if (Build.VERSION.SDK_INT >= 33) perm.launch(Manifest.permission.POST_NOTIFICATIONS)
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -332,7 +347,7 @@ class MainActivity : ComponentActivity() {
         LinearLayout.LayoutParams(w, h).apply { topMargin = dp(top); bottomMargin = dp(bottom) }
 
     private fun updateChip() {
-        val cap = if (capMbps > 0) "≤ ${fmtNum(capMbps)} Mbps · " else ""
+        val cap = (if (capMbps > 0) "≤ ${fmtNum(capMbps)} Mbps · " else "") + (if (fpsCap > 0) "≤ ${fmtNum(fpsCap)} fps · " else "")
         chip.text = "${codecs[codecIdx].first} · ${Levels.names[levelIdx]} · $cap${speeds[speedIdx]} · ${encs[encIdx]}\n" +
             (outDir?.let { folderName(it) } ?: "Movies/Converted")
     }
@@ -353,6 +368,11 @@ class MainActivity : ComponentActivity() {
             else { t.text = "$label: ✓ ${names.first()}" + (if (names.size > 1) " (+${names.size - 1})" else ""); t.setTextColor(cOk) }
         }
         line(hwTv, "Phần cứng", info.hw); line(swTv, "Phần mềm", info.sw)
+        aomTv?.let {
+            if (codecs[codecIdx].second != MimeTypes.VIDEO_AV1) { it.text = "libaom: chỉ dùng cho AV1"; it.setTextColor(cMu) }
+            else if (!AomNative.available() || android.os.Build.VERSION.SDK_INT < 34) { it.text = "libaom: ✗ cần arm64 + Android 14+"; it.setTextColor(cEr) }
+            else { it.text = "libaom: ✓ AV1 bằng CPU (chậm hơn, nén tốt hơn)"; it.setTextColor(cOk) }
+        }
     }
 
     // Tính lại dung lượng ước tính + ảnh xem trước cho các video đang chờ
@@ -365,6 +385,7 @@ class MainActivity : ComponentActivity() {
                 if (j.state != St.WAIT) return@forEach
                 val p = Planner.plan(this, j.uri, mime, lv, cap)
                 j.estBytes = p.estBytes; j.srcBytes = p.srcBytes
+                j.srcFps = p.fps; j.srcW = p.w; j.srcH = p.h; j.srcVideoBps = p.srcVideoBps
                 if (j.thumb == null) j.thumb = Planner.thumb(this, j.uri)
                 runOnUiThread { render() }
             }
@@ -388,7 +409,7 @@ class MainActivity : ComponentActivity() {
         sheet.addView(sc, lp(top = 4))
 
         body.addView(section("Codec đầu ra"), lp(top = 14))
-        body.addView(seg(codecs.map { it.first }, codecIdx) { codecIdx = it; prefs.edit().putInt("codec", it).apply(); updateEnc() }, lp(top = 8))
+        body.addView(seg(codecs.map { it.first }, codecIdx) { codecIdx = it; prefs.edit().putInt("codec", it).apply(); updateEnc(); if (it == 2) av1Notice() }, lp(top = 8))
 
         body.addView(section("Mức nén"), lp(top = 18))
         body.addView(seg(Levels.names, levelIdx) { levelIdx = it; prefs.edit().putInt("level", it).apply() }, lp(top = 8))
@@ -421,7 +442,55 @@ class MainActivity : ComponentActivity() {
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
         }
         body.addView(quick, lp(top = 8))
-        body.addView(tv("Bitrate tự tính theo video gốc rồi bị chặn ở mức này (ví dụ 12 Mbps như CapCut).", 12f, cMu).apply { setLineSpacing(0f, 1.2f) }, lp(top = 6))
+        val autoNote = tv("", 12f, cAc).apply { setLineSpacing(0f, 1.2f) }
+        body.addView(tv("⚡  Tự chọn Mbps", 14f, Color.WHITE, true).apply {
+            gravity = Gravity.CENTER; background = rip(cAc, 14); setPadding(0, dp(12), 0, dp(12))
+            setOnClickListener {
+                it.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                val infos = ConvertService.jobs.filter { x -> x.srcW > 0 }
+                val j = infos.firstOrNull { x -> x.state == St.WAIT } ?: infos.firstOrNull()
+                val fps = effFps(j?.srcFps ?: 0.0)
+                val rec = Planner.recommendMbps(j?.srcW ?: 0, j?.srcH ?: 0, fps, codecs[codecIdx].second, levelIdx, j?.srcVideoBps ?: 0.0)
+                capEt.setText(fmtNum(rec)); capEt.setSelection(capEt.text.length)
+                autoNote.text = if (j != null)
+                    "Đề xuất ${fmtNum(rec)} Mbps cho ${j.srcW}×${j.srcH} · ${fmtFps(fps)} fps · ${codecs[codecIdx].first} · ${Levels.names[levelIdx]}" +
+                        (if (infos.size > 1) ". Tính theo video đầu tiên; video nào có bitrate gốc thấp hơn vẫn tự hạ xuống." else "")
+                else "Chưa có video nên tính cho 1080p · 30 fps · ${codecs[codecIdx].first}. Thêm video rồi bấm lại để chính xác hơn."
+            }
+        }, lp(top = 10))
+        body.addView(autoNote, lp(top = 6))
+        body.addView(tv("Để trống = tự tính theo từng video. Mức này chỉ là trần: bitrate tự tính theo video gốc rồi bị chặn ở đây (ví dụ 12 Mbps như CapCut).", 12f, cMu).apply { setLineSpacing(0f, 1.2f) }, lp(top = 6))
+
+        // ----- FPS -----
+        body.addView(section("Giới hạn FPS"), lp(top = 18))
+        body.addView(tv(fpsInfoText(), 12.5f, cAc, true), lp(top = 8))
+        val fpsEt = EditText(this).apply {
+            setText(if (fpsCap > 0) fmtNum(fpsCap) else ""); hint = "Giữ FPS gốc"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setTextColor(cTx); setHintTextColor(cMu); textSize = 15f; background = shape(cSv, 14)
+            setPadding(dp(16), dp(12), dp(16), dp(12)); maxLines = 1
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    fpsCap = s.toString().replace(',', '.').toDoubleOrNull()?.takeIf { it >= 1 } ?: 0.0
+                    prefs.edit().putFloat("fps", fpsCap.toFloat()).apply()
+                }
+            })
+        }
+        val fpsRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        fpsRow.addView(fpsEt, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        fpsRow.addView(tv("fps", 14f, cMu, true).apply { setPadding(dp(12), 0, 0, 0) })
+        body.addView(fpsRow, lp(top = 8))
+        val fpsQuick = LinearLayout(this)
+        listOf("Gốc", "24", "30", "60").forEach { q ->
+            fpsQuick.addView(tv(q, 13f, cTx, true).apply {
+                gravity = Gravity.CENTER; background = rip(cSv, 12); setPadding(0, dp(9), 0, dp(9))
+                setOnClickListener { fpsEt.setText(if (q == "Gốc") "" else q); fpsEt.setSelection(fpsEt.text.length) }
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
+        }
+        body.addView(fpsQuick, lp(top = 8))
+        body.addView(tv("Chỉ giảm được FPS (bỏ bớt khung hình), không tăng được. Giảm FPS làm file nhẹ hơn và giúp encoder AV1 / H.265 yếu chạy ổn định hơn.", 12f, cMu).apply { setLineSpacing(0f, 1.2f) }, lp(top = 6))
 
         body.addView(section("Chế độ"), lp(top = 18))
         body.addView(seg(speeds, speedIdx) { speedIdx = it; prefs.edit().putInt("speed", it).apply() }, lp(top = 8))
@@ -429,8 +498,8 @@ class MainActivity : ComponentActivity() {
 
         body.addView(section("Bộ mã hoá"), lp(top = 18))
         body.addView(seg(encs, encIdx) { encIdx = it; prefs.edit().putInt("enc", it).apply() }, lp(top = 8))
-        hwTv = tv("", 12.5f, cMu); swTv = tv("", 12.5f, cMu)
-        body.addView(hwTv, lp(top = 8)); body.addView(swTv, lp(top = 2))
+        hwTv = tv("", 12.5f, cMu); swTv = tv("", 12.5f, cMu); aomTv = tv("", 12.5f, cMu)
+        body.addView(hwTv, lp(top = 8)); body.addView(swTv, lp(top = 2)); body.addView(aomTv, lp(top = 2))
 
         body.addView(section("Thư mục lưu"), lp(top = 18))
         val fRow = LinearLayout(this).apply {
@@ -492,7 +561,7 @@ class MainActivity : ComponentActivity() {
         } else {
             ConvertService.jobs.filter { it.state == St.WAIT }.forEach {   // áp cài đặt hiện tại cho các file đang chờ
                 it.mime = codecs[codecIdx].second; it.fast = speedIdx == 1; it.outDir = outDir; it.deleteOriginal = delOrig
-                it.enc = encIdx; it.keepTime = keepTime; it.level = levelIdx; it.capMbps = capMbps
+                it.enc = encIdx; it.keepTime = keepTime; it.level = levelIdx; it.capMbps = capMbps; it.fps = fpsCap
             }
             ConvertService.active = true
             ContextCompat.startForegroundService(this, Intent(this, ConvertService::class.java))
@@ -500,7 +569,68 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onResume() { super.onResume(); ConvertService.onChange = { runOnUiThread { render() } }; render() }
+    override fun onResume() { super.onResume(); ConvertService.onChange = { runOnUiThread { render() } }; render(); checkBattery() }
+
+    // ---------- Bắt buộc tắt tối ưu pin để app không bị hệ thống kill khi đang chuyển đổi ----------
+    private fun ignoringBattery(): Boolean =
+        try { (getSystemService(POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName) } catch (_: Exception) { true }
+
+    private fun checkBattery() {
+        if (ignoringBattery()) { battDlg?.dismiss(); battDlg = null; showReport(); return }
+        if (battDlg?.isShowing == true) return
+        val d = AlertDialog.Builder(this).setTitle("Cho phép app chạy nền")
+            .setMessage("Chuyển đổi video mất nhiều phút. Nếu bật tối ưu pin, hệ thống có thể tắt app giữa chừng.\n\n" +
+                "Bấm “Mở cài đặt” rồi chọn “Cho phép” (hoặc Pin → Không hạn chế / Không tối ưu hoá). Cần làm bước này để dùng app.")
+            .setCancelable(false)
+            .setPositiveButton("Mở cài đặt", null)
+            .setNegativeButton("Thoát") { _, _ -> finishAffinity() }
+            .create()
+        d.setOnShowListener { d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { requestBattery() } }
+        battDlg = d; d.show()
+    }
+
+    private fun requestBattery() {
+        val pkg = Uri.parse("package:$packageName")
+        try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg)); return } catch (_: Exception) {}
+        try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); return } catch (_: Exception) {}
+        try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg)) } catch (_: Exception) {}
+    }
+
+    // ---------- Báo cáo khi lần trước app chết giữa lúc mã hoá ----------
+    private fun showReport() {
+        val r = report ?: return
+        report = null
+        val cn = codecs.firstOrNull { it.second == r.mime }?.first ?: "video"
+        val msg = when (r.kind) {
+            1 -> "Lần trước app dừng đột ngột (crash) khi đang mã hoá $cn." +
+                (if (r.mime == MimeTypes.VIDEO_AV1) "\n\nMình đã chuyển về H.265. Muốn thử lại AV1: chọn bộ mã hoá “Phần mềm” hoặc giảm FPS trong Cài đặt." else "")
+            2 -> "Lần trước app bị hệ thống tắt khi đang mã hoá $cn (thiếu RAM hoặc bị giới hạn nền), không phải lỗi codec.\n\nHãy giữ nguyên quyền chạy nền và khoá app trong màn hình đa nhiệm."
+            else -> "Lần trước app dừng giữa lúc mã hoá $cn, chưa rõ nguyên nhân."
+        } + (if (r.detail.isNotEmpty()) "\n\nChi tiết: ${r.detail}" else "")
+        AlertDialog.Builder(this).setTitle("App đã dừng bất thường").setMessage(msg).setPositiveButton("Đã hiểu", null).show()
+        updateChip()
+    }
+
+    private fun av1Notice() {
+        val i = Enc.list(MimeTypes.VIDEO_AV1)
+        val m = when {
+            i.hw.isEmpty() && i.sw.isEmpty() -> "Máy không có encoder AV1. Hãy dùng H.265 hoặc H.264."
+            CrashGuard.av1Bad(this) -> "AV1 từng làm app dừng đột ngột trên máy này. Nên dùng H.265, hoặc thử bộ mã hoá “Phần mềm”."
+            else -> return
+        }
+        Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+    }
+
+    // FPS dùng để tính gợi ý: FPS đã đặt nếu thấp hơn FPS gốc, ngược lại FPS gốc (mặc định 30)
+    private fun effFps(src: Double): Double =
+        if (fpsCap > 0 && (src <= 0 || fpsCap < src)) fpsCap else if (src > 0) src else 30.0
+
+    private fun fpsInfoText(): String {
+        val all = ConvertService.jobs
+        if (all.isEmpty()) return "Thêm video để xem FPS hiện tại"
+        val v = all.filter { it.srcFps > 0 }.map { fmtFps(it.srcFps) }.distinct()
+        return if (v.isEmpty()) "Đang đọc FPS của video…" else "FPS hiện tại: ${v.joinToString(" · ")}" + (if (all.size > 1) "  (${all.size} video)" else "")
+    }
     override fun onPause() { super.onPause(); ConvertService.onChange = null }
 
     // ---------- Thẻ video trong hàng đợi (cập nhật tại chỗ, không dựng lại) ----------
