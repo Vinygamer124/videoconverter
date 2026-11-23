@@ -3,9 +3,8 @@ package com.alex.videoconv
 import android.app.*
 import android.content.*
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.media.MediaCodecInfo
-import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.*
@@ -18,6 +17,12 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.transformer.*
 import java.io.File
 import java.io.IOException
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 enum class St { WAIT, RUN, SAVE, DONE, ERR }
 
@@ -28,21 +33,26 @@ class Job(
     var state = St.WAIT
     var progress = 0
     var msg = ""
-    var t0 = 0L
+    var t0 = 0L; var wallStart = 0L
     var durSec = 0.0
-    var etaSec = -1.0
-    var lastP = 0; var lastT = 0L; var ema = 0.0
-    fun reset() { state = St.WAIT; progress = 0; msg = ""; etaSec = -1.0; lastP = 0; lastT = 0L; ema = 0.0 }
-}
-
-fun fmtDur(sec: Double): String {
-    val s = Math.max(0, Math.round(sec)).toInt()
-    return when {
-        s < 60 -> "${s}s"
-        s < 3600 -> "${s / 60}p ${s % 60}s"
-        else -> "${s / 3600}g ${(s % 3600) / 60}p"
+    var srcBytes = 0L; var estBytes = 0L; var outBytes = 0L
+    var enc = 0                 // 0 tự động, 1 phần cứng, 2 phần mềm
+    var level = 1               // mức nén
+    var capMbps = 0.0           // giới hạn tối đa, 0 = không giới hạn
+    var keepTime = true
+    var tCreate = 0L; var tMod = 0L
+    var savePct = 0; var saveEta = -1.0; var saveSpeed = 0.0
+    val eta = Eta()
+    val szp = SizePred()
+    @Volatile var thumb: Bitmap? = null
+    fun reset() {
+        state = St.WAIT; progress = 0; msg = ""
+        savePct = 0; saveEta = -1.0; saveSpeed = 0.0
+        eta.reset(SystemClock.elapsedRealtime()); szp.reset(estBytes)
     }
 }
+
+fun clockText(ms: Long): String = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ms))
 
 private class StopEx : Exception()
 
@@ -53,7 +63,9 @@ class ConvertService : Service() {
         var onChange: (() -> Unit)? = null
         @Volatile var active = false
         const val CH = "convert"
+        const val CH_DONE = "done"
         const val ACT_STOP = "com.alex.videoconv.STOP"
+        const val ACCENT = 0xFF4F6BFF.toInt()
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -61,10 +73,11 @@ class ConvertService : Service() {
     private var transformer: Transformer? = null
     private var tmpFile: File? = null
     private var pfd: ParcelFileDescriptor? = null
-    private var target: Uri? = null          // file đích đang được ghi trực tiếp
+    private var target: Uri? = null
     private var direct = false
     private var curBr = 0
-    @Volatile private var runId = 0          // tăng mỗi lần Dừng để huỷ mọi việc đang dở
+    private val session = ArrayList<Job>()
+    @Volatile private var runId = 0
     private var wake: PowerManager.WakeLock? = null
     private lateinit var nm: NotificationManager
 
@@ -74,10 +87,15 @@ class ConvertService : Service() {
         super.onCreate()
         cacheDir.listFiles()?.filter { it.name.startsWith("out_") }?.forEach { it.delete() }
         nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CH, "Chuyển đổi video", NotificationManager.IMPORTANCE_LOW))
+        nm.createNotificationChannel(NotificationChannel(CH, "Đang chuyển đổi", NotificationManager.IMPORTANCE_LOW).apply {
+            description = "Tiến độ chuyển đổi video"; setShowBadge(false)
+        })
+        nm.createNotificationChannel(NotificationChannel(CH_DONE, "Hoàn tất", NotificationManager.IMPORTANCE_DEFAULT).apply {
+            description = "Báo kết quả khi chuyển đổi xong"
+        })
         wake = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "videoconv:wake").apply { acquire(6 * 60 * 60 * 1000L) }
-        startForeground(1, notif("Đang chuẩn bị…", 0, true), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        startForeground(1, notifFor(null), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
@@ -86,25 +104,49 @@ class ConvertService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun notif(text: String, p: Int, indeterminate: Boolean = false): Notification {
-        val stop = PendingIntent.getService(this, 1, Intent(this, ConvertService::class.java).setAction(ACT_STOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        return NotificationCompat.Builder(this, CH)
-            .setSmallIcon(R.drawable.ic_stat).setContentTitle("Video Converter")
-            .setContentText(text).setOngoing(true).setOnlyAlertOnce(true)
-            .setProgress(100, p, indeterminate)
-            .addAction(0, "Dừng", stop)
-            .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
-            .build()
+    // ---------- Thông báo ----------
+    private fun openApp() = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+    private fun stopPi() = PendingIntent.getService(this, 1, Intent(this, ConvertService::class.java).setAction(ACT_STOP),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    private fun codecLabel(m: String) = when (m) { MimeTypes.VIDEO_H265 -> "H.265"; MimeTypes.VIDEO_AV1 -> "AV1"; else -> "H.264" }
+
+    private fun notifFor(j: Job?): Notification {
+        val b = NotificationCompat.Builder(this, CH)
+            .setSmallIcon(R.drawable.ic_stat).setColor(ACCENT)
+            .setOngoing(true).setOnlyAlertOnce(true).setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setContentIntent(openApp()).addAction(0, "Dừng", stopPi())
+        if (j == null) return b.setContentTitle("Video Converter").setContentText("Đang chuẩn bị…").setProgress(0, 0, true).build()
+        b.setSubText("File ${jobs.indexOf(j) + 1}/${jobs.size} · ${codecLabel(j.mime)}")
+        b.setLargeIcon(j.thumb)
+        if (j.wallStart > 0) b.setUsesChronometer(true).setWhen(j.wallStart).setShowWhen(true)   // đồng hồ đã chạy
+        if (j.state == St.SAVE) {
+            val sp = "%.0f MB/s".format(j.saveSpeed) + (if (j.saveEta >= 0) " · còn ${fmtDur(j.saveEta)}" else "")
+            b.setContentTitle("Đang lưu · ${j.savePct}%").setContentText(j.name).setProgress(100, j.savePct, false)
+                .setStyle(NotificationCompat.BigTextStyle().bigText("${j.name}\n$sp"))
+        } else {
+            val e = j.eta.text()
+            val etaPart = when { j.progress >= 98 -> "sắp xong"; j.eta.disp < 0 -> "đang đo tốc độ…"; else -> "còn ${e.t}" }
+            val sz = j.szp.est()
+            val szLine = if (sz != null) "≈ ${humanSize(sz[1])}" + (if (j.srcBytes > 0) " (${deltaText(sz[1], j.srcBytes)})" else "") else ""
+            val big = buildString {
+                append(j.name); append("\n$etaPart")
+                if (e.atMs > 0) append(" · xong lúc ${clockText(e.atMs)}")
+                if (szLine.isNotEmpty()) append("\nDung lượng dự đoán $szLine")
+            }
+            b.setContentTitle("${j.progress}% · $etaPart")
+                .setContentText(if (szLine.isNotEmpty()) "${j.name} · $szLine" else j.name)
+                .setProgress(100, j.progress, j.progress == 0)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(big))
+        }
+        return b.build()
     }
 
     private fun update(j: Job) {
-        val eta = if (j.state == St.RUN && j.etaSec >= 0) " · còn ~${fmtDur(j.etaSec)}" else ""
-        nm.notify(1, notif("${j.name}: ${j.progress}%$eta", j.progress, j.state == St.RUN && j.progress == 0))
+        if (j.state == St.RUN || j.state == St.SAVE) nm.notify(1, notifFor(j))
         onChange?.invoke()
     }
 
-    // ---------- Dừng ----------
+    // ---------- Dừng / kết thúc ----------
     private fun stopAll() {
         runId++
         transformer?.cancel(); transformer = null
@@ -117,19 +159,31 @@ class ConvertService : Service() {
 
     private fun endAll() {
         current = null; active = false
-        val done = jobs.count { it.state == St.DONE }
-        if (done > 0) {
-            nm.notify(2, NotificationCompat.Builder(this, CH).setSmallIcon(R.drawable.ic_stat)
-                .setContentTitle("Video Converter").setContentText("Hoàn tất $done/${jobs.size} file")
-                .setAutoCancel(true)
-                .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+        val done = session.filter { it.state == St.DONE }
+        val err = session.count { it.state == St.ERR }
+        if (done.isNotEmpty() || err > 0) {
+            val src = done.sumOf { it.srcBytes }; val out = done.sumOf { it.outBytes }
+            val saved = when {
+                src <= 0 || out <= 0 -> ""
+                out <= src -> "Nhẹ đi ${humanSize(src - out)} (${deltaText(out, src)})"
+                else -> "Nặng hơn ${humanSize(out - src)} (${deltaText(out, src)})"
+            }
+            val title = if (err == 0) "Hoàn tất ${done.size} video" else "Xong ${done.size}/${session.size} video · $err lỗi"
+            val lines = session.take(6).joinToString("\n") {
+                if (it.state == St.DONE) "✓ ${it.name} · ${humanSize(it.outBytes)}" + (if (it.srcBytes > 0) " (${deltaText(it.outBytes, it.srcBytes)})" else "")
+                else "✕ ${it.name} · ${it.msg.take(60)}"
+            } + (if (session.size > 6) "\n… và ${session.size - 6} video khác" else "")
+            nm.notify(2, NotificationCompat.Builder(this, CH_DONE)
+                .setSmallIcon(R.drawable.ic_stat).setColor(ACCENT)
+                .setContentTitle(title).setContentText(saved.ifEmpty { "Bấm để xem kết quả" })
+                .setStyle(NotificationCompat.BigTextStyle().bigText(if (saved.isNotEmpty()) "$saved\n$lines" else lines))
+                .setCategory(NotificationCompat.CATEGORY_STATUS).setAutoCancel(true).setContentIntent(openApp())
                 .build())
         }
         onChange?.invoke()
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
     }
 
-    // Bỏ file đích dở dang + file tạm
     private fun discardOutput() {
         try { pfd?.close() } catch (_: Exception) {}
         pfd = null
@@ -143,10 +197,22 @@ class ConvertService : Service() {
         val j = jobs.firstOrNull { it.state == St.WAIT }
         if (j == null) { endAll(); return }
         current = j
-        j.state = St.RUN; j.progress = 0; j.msg = ""; j.etaSec = -1.0; j.lastP = 0; j.lastT = 0L; j.ema = 0.0
-        j.t0 = SystemClock.elapsedRealtime(); update(j)
-        val br = planBitrate(j)
-        startEncode(j, br, true)
+        val now = SystemClock.elapsedRealtime()
+        j.state = St.RUN; j.progress = 0; j.msg = ""; j.t0 = now; j.wallStart = System.currentTimeMillis()
+        j.eta.reset(now)
+        if (!session.contains(j)) session.add(j)
+        update(j)
+        readOrigTimes(j)
+        if (j.thumb == null) j.thumb = Planner.thumb(this, j.uri)
+        val info = Enc.list(j.mime)
+        val cn = codecLabel(j.mime)
+        if (j.enc == 1 && info.hw.isEmpty()) { fail(j, "Máy không có encoder phần cứng cho $cn. Hãy đổi sang Tự động hoặc Phần mềm."); return }
+        if (j.enc == 2 && info.sw.isEmpty()) { fail(j, "Máy không có encoder phần mềm cho $cn. Hãy đổi sang Tự động hoặc Phần cứng."); return }
+        val plan = Planner.plan(this, j.uri, j.mime, j.level, j.capMbps)
+        j.durSec = plan.durSec; j.srcBytes = plan.srcBytes; j.estBytes = plan.estBytes
+        j.szp.reset(plan.estBytes)
+        update(j)
+        startEncode(j, plan.bitrate, true)
     }
 
     private fun spaceOk(path: String, need: Long): Boolean =
@@ -155,14 +221,13 @@ class ConvertService : Service() {
     private fun startEncode(j: Job, br: Int, tryDirect: Boolean) {
         val my = runId
         curBr = br
-        val need = (br * j.durSec / 8 * 1.05).toLong()
+        val need = j.estBytes
         var outPath = ""
         direct = false
         if (tryDirect) {
             try {
-                if (j.outDir == null && j.durSec > 0 &&
-                    !spaceOk(Environment.getExternalStorageDirectory().absolutePath, need))
-                    throw IOException("Không đủ bộ nhớ: cần trống ~${need / 1048576} MB")
+                if (j.outDir == null && need > 0 && !spaceOk(Environment.getExternalStorageDirectory().absolutePath, need))
+                    throw IOException("Không đủ bộ nhớ: cần trống ~${humanSize(need)}")
                 val u = createTarget(j)
                 target = u
                 val p = contentResolver.openFileDescriptor(u, "rw") ?: throw IOException("không mở được file đích")
@@ -175,8 +240,8 @@ class ConvertService : Service() {
             }
         }
         if (!direct) {
-            if (j.durSec > 0 && !spaceOk(cacheDir.absolutePath, need)) {
-                fail(j, "Không đủ bộ nhớ: cần trống ~${need / 1048576} MB cho file tạm, hiện còn ${StatFs(cacheDir.absolutePath).availableBytes / 1048576} MB")
+            if (need > 0 && !spaceOk(cacheDir.absolutePath, need)) {
+                fail(j, "Không đủ bộ nhớ: cần trống ~${humanSize(need)} cho file tạm, hiện còn ${humanSize(StatFs(cacheDir.absolutePath).availableBytes)}")
                 return
             }
             val tmp = File(cacheDir, "out_${System.nanoTime()}.mp4")
@@ -186,12 +251,13 @@ class ConvertService : Service() {
         val vb = VideoEncoderSettings.Builder().setBitrate(br)
             .setBitrateMode(if (j.fast) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                             else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-        try { // không phải bản Media3 nào cũng có hàm này, nên gọi qua reflection
+        try {
             vb.javaClass.getMethod("setEncoderPerformanceParameters", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
                 .invoke(vb, Short.MAX_VALUE.toInt(), 1)
         } catch (_: Throwable) {}
         val enc = DefaultEncoderFactory.Builder(this)
             .setEnableFallback(false)
+            .setVideoEncoderSelector(Enc.selector(j.enc))
             .setRequestedVideoEncoderSettings(vb.build())
             .build()
 
@@ -210,8 +276,8 @@ class ConvertService : Service() {
                     transformer = null
                     val ioLike = e.errorCode == 1000 || e.errorCode in 2000..2999 || e.errorCode == 7001
                     discardOutput()
-                    if (wasDirect && ioLike) {   // ghi trực tiếp không chạy được trên máy/thư mục này -> thử lại bằng file tạm
-                        j.progress = 0; j.etaSec = -1.0; j.lastT = 0L; j.ema = 0.0; j.t0 = SystemClock.elapsedRealtime()
+                    if (wasDirect && ioLike) {
+                        restartClock(j)
                         j.msg = "Máy không cho ghi trực tiếp, đã chuyển sang file tạm. "
                         startEncode(j, br, false)
                     } else fail(j, "Lỗi: ${e.errorCodeName}")
@@ -220,6 +286,12 @@ class ConvertService : Service() {
         transformer = t
         t.start(MediaItem.fromUri(j.uri), outPath)
         poll(t, j, my)
+    }
+
+    private fun restartClock(j: Job) {
+        val now = SystemClock.elapsedRealtime()
+        j.progress = 0; j.t0 = now; j.wallStart = System.currentTimeMillis()
+        j.eta.reset(now); j.szp.reset(j.estBytes)
     }
 
     private fun fail(j: Job, m: String) {
@@ -231,57 +303,48 @@ class ConvertService : Service() {
     private fun poll(t: Transformer, j: Job, my: Int) {
         if (runId != my || transformer !== t || j.state != St.RUN) return
         val h = ProgressHolder()
-        if (t.getProgress(h) != Transformer.PROGRESS_STATE_NOT_STARTED) { j.progress = h.progress; calcEta(j) }
+        val now = SystemClock.elapsedRealtime()
+        if (t.getProgress(h) != Transformer.PROGRESS_STATE_NOT_STARTED) {
+            j.progress = h.progress
+            j.eta.push((now - j.t0) / 1000.0, h.progress / 100.0)
+            val sz = if (direct) (try { pfd?.statSize ?: 0L } catch (_: Exception) { 0L }) else (tmpFile?.length() ?: 0L)
+            j.szp.push(h.progress / 100.0, sz)
+        }
+        j.eta.tick(now)
         update(j)
         main.postDelayed({ poll(t, j, my) }, 500)
-    }
-
-    private fun calcEta(j: Job) {
-        val now = SystemClock.elapsedRealtime()
-        val el = (now - j.t0) / 1000.0
-        val p = j.progress
-        if (j.lastT != 0L && now - j.lastT >= 2000 && p > j.lastP) {
-            val inst = (p - j.lastP) / ((now - j.lastT) / 1000.0)
-            j.ema = if (j.ema == 0.0) inst else 0.7 * j.ema + 0.3 * inst
-            j.lastP = p; j.lastT = now
-        } else if (j.lastT == 0L) { j.lastP = p; j.lastT = now }
-        if (el < 4 || p < 2) return
-        val global = p / el
-        val rate = if (j.ema > 0) 0.6 * global + 0.4 * j.ema else global
-        if (rate <= 0) return
-        val est = (100 - p) / rate
-        j.etaSec = if (j.etaSec < 0) est else {
-            val dec = Math.max(0.0, j.etaSec - 0.5)
-            dec + 0.25 * (est - dec)
-        }
     }
 
     // ---------- Hoàn tất ----------
     private fun completeDirect(j: Job) {
         j.progress = 100
         val sz = try { pfd?.statSize ?: 0L } catch (_: Exception) { 0L }
+        if (j.keepTime && j.tCreate > 0 && sz > 0) pfd?.let { patchFd(it, j.tCreate) }
         try { pfd?.close() } catch (_: Exception) {}
         pfd = null
         val u = target
-        if (u == null || sz <= 0) {   // ghi trực tiếp không ra dữ liệu -> thử lại bằng file tạm
+        if (u == null || sz <= 0) {
             discardOutput(); transformer = null
-            j.progress = 0; j.etaSec = -1.0; j.lastT = 0L; j.ema = 0.0; j.t0 = SystemClock.elapsedRealtime()
+            restartClock(j)
             j.msg = "Máy không cho ghi trực tiếp, đã chuyển sang file tạm. "
             startEncode(j, curBr, false); return
         }
         target = null; transformer = null
+        j.outBytes = sz
         finalizeOk(j, u)
         update(j); current = null; next()
     }
 
-    // Dự phòng: ghi ra file tạm rồi chép sang đích (chỉ khi ghi trực tiếp không được)
     private fun saveFromTmp(j: Job, tmp: File, my: Int) {
         j.state = St.SAVE; j.progress = 100; update(j)
         Thread {
             var u: Uri? = null
             try {
+                if (j.keepTime && j.tCreate > 0) patchFile(tmp, j.tCreate)
                 u = createTarget(j)
                 var copied = 0L
+                val total = tmp.length(); val ts = SystemClock.elapsedRealtime(); var lastUi = 0L
+                j.savePct = 0; j.saveEta = -1.0; j.saveSpeed = 0.0
                 contentResolver.openOutputStream(u, "w")!!.use { o ->
                     tmp.inputStream().use { ins ->
                         val buf = ByteArray(1 shl 20)
@@ -289,11 +352,23 @@ class ConvertService : Service() {
                             if (runId != my) throw StopEx()
                             val n = ins.read(buf); if (n < 0) break
                             o.write(buf, 0, n); copied += n
+                            val now = SystemClock.elapsedRealtime()
+                            if (now - lastUi >= 300) {
+                                lastUi = now
+                                val el = (now - ts) / 1000.0
+                                val sp = if (el > 0.5) copied / el else 0.0
+                                j.savePct = if (total > 0) (copied * 100 / total).toInt() else 0
+                                j.saveSpeed = sp / 1048576.0
+                                j.saveEta = if (sp > 0) (total - copied) / sp else -1.0
+                                update(j)
+                            }
                         }
                     }
                 }
                 if (runId != my) throw StopEx()
+                j.savePct = 100
                 if (copied <= 0 || copied != tmp.length()) throw IOException("file ghi ra không đầy đủ")
+                j.outBytes = copied
                 finalizeOk(j, u); j.state = St.DONE
             } catch (e: StopEx) {
                 u?.let { deleteDoc(it) }; tmp.delete(); return@Thread
@@ -310,8 +385,24 @@ class ConvertService : Service() {
     }
 
     private fun finalizeOk(j: Job, u: Uri) {
+        val keep = j.keepTime && j.tMod > 0
+        if (keep) setMtime(u, j.tMod)
         if (u.authority == MediaStore.AUTHORITY) {
-            try { contentResolver.update(u, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null) } catch (_: Exception) {}
+            val ok = try {
+                contentResolver.update(u, ContentValues().apply {
+                    put(MediaStore.Video.Media.IS_PENDING, 0)
+                    if (keep) {
+                        put(MediaStore.Video.Media.DATE_TAKEN, j.tCreate)
+                        put(MediaStore.Video.Media.DATE_MODIFIED, j.tMod / 1000)
+                        put(MediaStore.Video.Media.DATE_ADDED, j.tMod / 1000)
+                    }
+                }, null, null) > 0
+            } catch (_: Exception) { false }
+            if (!ok) {
+                try { contentResolver.update(u, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null) } catch (_: Exception) {}
+                if (keep) setDates(u, j.tCreate, j.tMod)
+            }
+            if (keep) { val c = j.tCreate; val m = j.tMod; main.postDelayed({ setDates(u, c, m) }, 4000) }
         }
         j.state = St.DONE; j.progress = 100
         j.msg += "Đã lưu ${nameOfUri(u)}"
@@ -321,6 +412,113 @@ class ConvertService : Service() {
             j.msg += if (!ok) " · giữ file gốc (không xác minh được file mới)"
                      else if (deleteDoc(j.uri)) " · đã xoá file gốc" else " · không xoá được file gốc"
         }
+    }
+
+    // ---------- Mốc thời gian gốc ----------
+    private fun readOrigTimes(j: Job) {
+        var mod = 0L
+        try {
+            contentResolver.query(j.uri, arrayOf(DocumentsContract.Document.COLUMN_LAST_MODIFIED), null, null, null)?.use {
+                if (it.moveToFirst() && !it.isNull(0)) mod = it.getLong(0)
+            }
+        } catch (_: Exception) {}
+        var create = 0L
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(this, j.uri)
+            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DATE)?.let { create = parseMetaDate(it) }
+        } catch (_: Exception) {} finally { r.release() }
+        val min = 631152000000L
+        if (mod < min) mod = 0L
+        if (create < min) create = 0L
+        if (create == 0L) create = mod
+        if (mod == 0L) mod = create
+        j.tCreate = create; j.tMod = mod
+    }
+
+    private fun parseMetaDate(s: String): Long = try {
+        val f = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", Locale.US)
+        f.timeZone = java.util.TimeZone.getTimeZone("UTC")
+        f.parse(s.substring(0, 15))?.time ?: 0L
+    } catch (_: Exception) { 0L }
+
+    private fun setMtime(u: Uri, ms: Long) {
+        try { contentResolver.openFileDescriptor(u, "rw")?.use { p -> File("/proc/self/fd/${p.fd}").setLastModified(ms) } } catch (_: Exception) {}
+    }
+
+    private fun setDates(u: Uri, create: Long, mod: Long) {
+        try {
+            contentResolver.update(u, ContentValues().apply {
+                put(MediaStore.Video.Media.DATE_TAKEN, create)
+                put(MediaStore.Video.Media.DATE_MODIFIED, mod / 1000)
+            }, null, null)
+        } catch (_: Exception) {}
+    }
+
+    private fun patchFd(p: ParcelFileDescriptor, ms: Long) {
+        try {
+            ParcelFileDescriptor.AutoCloseInputStream(p.dup()).use { ins ->
+                ParcelFileDescriptor.AutoCloseOutputStream(p.dup()).use { outs -> patchMp4(ins.channel, outs.channel, ms) }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun patchFile(f: File, ms: Long) {
+        try { RandomAccessFile(f, "rw").use { patchMp4(it.channel, it.channel, ms) } } catch (_: Exception) {}
+    }
+
+    private fun patchMp4(rd: FileChannel, wr: FileChannel, unixMs: Long) {
+        val t = unixMs / 1000 + 2082844800L
+        val size = rd.size()
+        var pos = 0L
+        val hdr = ByteBuffer.allocate(16)
+        while (pos + 8 <= size) {
+            hdr.clear()
+            val n = rd.read(hdr, pos); if (n < 8) return
+            var boxSize = hdr.getInt(0).toLong() and 0xFFFFFFFFL
+            val type = hdr.getInt(4)
+            var headerLen = 8
+            if (boxSize == 1L) { if (n < 16) return; boxSize = hdr.getLong(8); headerLen = 16 }
+            else if (boxSize == 0L) boxSize = size - pos
+            if (boxSize < headerLen) return
+            if (type == 0x6D6F6F76) {
+                if (boxSize > 64L * 1024 * 1024) return
+                val len = boxSize.toInt()
+                val arr = ByteArray(len)
+                val bb = ByteBuffer.wrap(arr)
+                while (bb.hasRemaining()) { if (rd.read(bb, pos + bb.position()) < 0) return }
+                patchBoxes(arr, headerLen, len, t)
+                val out = ByteBuffer.wrap(arr)
+                var wp = pos
+                while (out.hasRemaining()) wp += wr.write(out, wp)
+                try { wr.force(true) } catch (_: Exception) {}
+                return
+            }
+            pos += boxSize
+        }
+    }
+
+    private fun i32(b: ByteArray, o: Int): Int =
+        ((b[o].toInt() and 255) shl 24) or ((b[o + 1].toInt() and 255) shl 16) or ((b[o + 2].toInt() and 255) shl 8) or (b[o + 3].toInt() and 255)
+
+    private fun patchBoxes(b: ByteArray, start: Int, end: Int, t: Long) {
+        var o = start
+        while (o + 8 <= end) {
+            val sz = i32(b, o)
+            if (sz < 8 || o + sz > end) return
+            when (i32(b, o + 4)) {
+                0x6D766864, 0x746B6864, 0x6D646864 -> setTimes(b, o + 8, t)
+                0x7472616B, 0x6D646961 -> patchBoxes(b, o + 8, o + sz, t)
+            }
+            o += sz
+        }
+    }
+
+    private fun put(b: ByteArray, o: Int, v: Long, n: Int) { for (i in 0 until n) b[o + i] = (v shr (8 * (n - 1 - i))).toByte() }
+
+    private fun setTimes(b: ByteArray, p: Int, t: Long) {
+        if (b[p].toInt() == 1) { put(b, p + 4, t, 8); put(b, p + 12, t, 8) }
+        else { val v = t and 0xFFFFFFFFL; put(b, p + 4, v, 4); put(b, p + 8, v, 4) }
     }
 
     // ---------- File đích ----------
@@ -362,42 +560,6 @@ class ConvertService : Service() {
     private fun deleteDoc(u: Uri): Boolean {
         try { if (DocumentsContract.isDocumentUri(this, u) && DocumentsContract.deleteDocument(contentResolver, u)) return true } catch (_: Exception) {}
         return try { contentResolver.delete(u, null, null) > 0 } catch (_: Exception) { false }
-    }
-
-    // Bitrate tự động theo video gốc (giống planBitrate trong bản HTML)
-    private fun planBitrate(j: Job): Int {
-        val eff = mapOf(MimeTypes.VIDEO_H264 to 1.0, MimeTypes.VIDEO_H265 to 0.70, MimeTypes.VIDEO_AV1 to 0.60)
-        try {
-            var w = 0; var h = 0; var durMs = 0L
-            MediaMetadataRetriever().also { r ->
-                try {
-                    r.setDataSource(this, j.uri)
-                    w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 0
-                    h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 0
-                    durMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
-                } finally { r.release() }
-            }
-            val size = sizeOf(j.uri)
-            var srcMime = MimeTypes.VIDEO_H264; var hasAudio = false
-            MediaExtractor().also { e ->
-                try {
-                    e.setDataSource(this, j.uri, null)
-                    for (i in 0 until e.trackCount) {
-                        val m = e.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
-                        if (m.startsWith("video/") && srcMime == MimeTypes.VIDEO_H264) srcMime = m
-                        if (m.startsWith("audio/")) hasAudio = true
-                    }
-                } finally { e.release() }
-            }
-            j.durSec = durMs / 1000.0
-            if (durMs <= 0 || size <= 0) return 8_000_000
-            val total = size * 8.0 / (durMs / 1000.0)
-            val video = if (hasAudio) Math.max(total - 160_000, total * 0.8) else total
-            val ratio = (eff[j.mime] ?: 1.0) / (eff[srcMime] ?: 1.0)
-            val floor = w.toDouble() * h * 0.6 * (eff[j.mime] ?: 1.0)
-            val target = Math.min(video, Math.max(floor, video * ratio * 1.15))
-            return target.toInt().coerceIn(500_000, 80_000_000)
-        } catch (_: Exception) { return 8_000_000 }
     }
 
     override fun onDestroy() {
